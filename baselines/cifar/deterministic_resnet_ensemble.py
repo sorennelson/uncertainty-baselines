@@ -13,9 +13,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""BatchEnsemble Wide ResNet 28-10 on CIFAR-10 and CIFAR-100."""
+"""Wide ResNet 28-10 on CIFAR-10/100 trained with maximum likelihood.
+
+Hyperparameters differ slightly from the original paper's code
+(https://github.com/szagoruyko/wide-residual-networks) as TensorFlow uses, for
+example, l2 instead of weight decay, and a different parameterization for SGD's
+momentum.
+"""
 
 import os
+import random
 import time
 from absl import app
 from absl import flags
@@ -23,26 +30,107 @@ from absl import logging
 import robustness_metrics as rm
 import tensorflow as tf
 import tensorflow_datasets as tfds
+import numpy as np
 import uncertainty_baselines as ub
 import utils  # local file import
 from tensorboard.plugins.hparams import api as hp
 
-flags.DEFINE_integer('ensemble_size', 4, 'Size of ensemble.')
-flags.DEFINE_integer('width_multiplier', 10, 'Width multiplier.')
-flags.DEFINE_float('random_sign_init', -0.5,
-                   'Use random sign init for fast weights.')
-flags.DEFINE_float('fast_weight_lr_multiplier', 0.5,
-                   'fast weights lr multiplier.')
+from classification_models.tfkeras import Classifiers
 
-# Redefining default values
-flags.FLAGS.set_default('l2', 3e-4)
-flags.FLAGS.set_default('lr_decay_epochs', ['80', '160', '180'])
-flags.FLAGS.set_default('train_epochs', 250)
+
+flags.DEFINE_float('label_smoothing', 0., 'Label smoothing parameter in [0,1].')
+flags.register_validator('label_smoothing',
+                         lambda ls: ls >= 0.0 and ls <= 1.0,
+                         message='--label_smoothing must be in [0, 1].')
+
+# Data Augmentation flags.
+flags.DEFINE_bool('augmix', False,
+                  'Whether to perform AugMix [4] on the input data.')
+flags.DEFINE_integer('aug_count', 1,
+                     'Number of augmentation operations in AugMix to perform '
+                     'on the input image. In the simgle model context, it'
+                     'should be 1. In the ensembles context, it should be'
+                     'ensemble_size if we perform random_augment only; It'
+                     'should be (ensemble_size - 1) if we perform augmix.')
+flags.DEFINE_float('augmix_prob_coeff', 0.5, 'Augmix probability coefficient.')
+flags.DEFINE_integer('augmix_depth', -1,
+                     'Augmix depth, -1 meaning sampled depth. This corresponds'
+                     'to line 7 in the Algorithm box in [4].')
+flags.DEFINE_integer('augmix_width', 3,
+                     'Augmix width. This corresponds to the k in line 5 in the'
+                     'Algorithm box in [4].')
+
+# Fine-grained specification of the hyperparameters (used when FLAGS.l2 is None)
+flags.DEFINE_float('bn_l2', None, 'L2 reg. coefficient for batch-norm layers.')
+flags.DEFINE_float('input_conv_l2', None,
+                   'L2 reg. coefficient for the input conv layer.')
+flags.DEFINE_float('group_1_conv_l2', None,
+                   'L2 reg. coefficient for the 1st group of conv layers.')
+flags.DEFINE_float('group_2_conv_l2', None,
+                   'L2 reg. coefficient for the 2nd group of conv layers.')
+flags.DEFINE_float('group_3_conv_l2', None,
+                   'L2 reg. coefficient for the 3rd group of conv layers.')
+flags.DEFINE_float('dense_kernel_l2', None,
+                   'L2 reg. coefficient for the kernel of the dense layer.')
+flags.DEFINE_float('dense_bias_l2', None,
+                   'L2 reg. coefficient for the bias of the dense layer.')
+
+
+flags.DEFINE_bool('collect_profile', False,
+                  'Whether to trace a profile with tensorboard')
+
+flags.DEFINE_bool('pretrained_resnet', False, 'Whether to use Pretrained ResNet')
+flags.DEFINE_string('resnet_depth','18','Depth of resnet')
+flags.DEFINE_integer('ensemble_size', 1, 'Ensemble size')
+
+
 FLAGS = flags.FLAGS
 
 
+
+def _extract_hyperparameter_dictionary():
+  """Create the dictionary of hyperparameters from FLAGS."""
+  flags_as_dict = FLAGS.flag_values_dict()
+  hp_keys = ub.models.models.wide_resnet.HP_KEYS
+  hps = {k: flags_as_dict[k] for k in hp_keys}
+  return hps
+
+
+def _generalized_energy_distance(labels, predictions, num_classes):
+  """Compute generalized energy distance.
+
+  See Eq. (8) https://arxiv.org/abs/2006.06015
+  where d(a, b) = (a - b)^2.
+
+  Args:
+    labels: [batch_size, num_classes] Tensor with empirical probabilities of
+      each class assigned by the labellers.
+    predictions: [batch_size, num_classes] Tensor of predicted probabilities.
+    num_classes: Integer.
+
+  Returns:
+    Tuple of Tensors (label_diversity, sample_diversity, ged).
+  """
+  y = tf.expand_dims(labels, -1)
+  y_hat = tf.expand_dims(predictions, -1)
+
+  non_diag = tf.expand_dims(1.0 - tf.eye(num_classes), 0)
+  distance = tf.reduce_sum(tf.reduce_sum(
+      non_diag * y * tf.transpose(y_hat, perm=[0, 2, 1]), -1), -1)
+  label_diversity = tf.reduce_sum(tf.reduce_sum(
+      non_diag * y * tf.transpose(y, perm=[0, 2, 1]), -1), -1)
+  sample_diversity = tf.reduce_sum(tf.reduce_sum(
+      non_diag * y_hat * tf.transpose(y_hat, perm=[0, 2, 1]), -1), -1)
+  ged = tf.reduce_mean(2 * distance - label_diversity - sample_diversity)
+  return label_diversity, sample_diversity, ged
+
+
 def main(argv):
+  fmt = '[%(filename)s:%(lineno)s] %(message)s'
+  formatter = logging.PythonFormatter(fmt)
+  logging.get_absl_handler().setFormatter(formatter)
   del argv  # unused arg
+
   tf.io.gfile.makedirs(FLAGS.output_dir)
   logging.info('Saving checkpoints at %s', FLAGS.output_dir)
   tf.random.set_seed(FLAGS.seed)
@@ -53,10 +141,6 @@ def main(argv):
   except:
     # Invalid device or cannot modify virtual devices once initialized.
     pass
-
-
-  per_core_batch_size = FLAGS.per_core_batch_size // FLAGS.ensemble_size
-  batch_size = per_core_batch_size * FLAGS.num_cores
 
   data_dir = FLAGS.data_dir
   if FLAGS.use_gpu:
@@ -70,36 +154,62 @@ def main(argv):
     tf.tpu.experimental.initialize_tpu_system(resolver)
     strategy = tf.distribute.TPUStrategy(resolver)
 
+  ds_info = tfds.builder(FLAGS.dataset).info
+  batch_size = FLAGS.per_core_batch_size * FLAGS.num_cores
+  train_dataset_size = (
+      ds_info.splits['train'].num_examples * FLAGS.train_proportion)
+  steps_per_epoch = int(train_dataset_size / batch_size)
+  logging.info('Steps per epoch %s', steps_per_epoch)
+  logging.info('Size of the dataset %s', ds_info.splits['train'].num_examples)
+  logging.info('Train proportion %s', FLAGS.train_proportion)
+  steps_per_eval = ds_info.splits['test'].num_examples // batch_size
+  num_classes = ds_info.features['label'].num_classes
+
+  aug_params = {
+      'augmix': FLAGS.augmix,
+      'aug_count': FLAGS.ensemble_size,
+      'augmix_depth': FLAGS.augmix_depth,
+      'augmix_prob_coeff': FLAGS.augmix_prob_coeff,
+      'augmix_width': FLAGS.augmix_width,
+  }
+
+  # Note that stateless_{fold_in,split} may incur a performance cost, but a
+  # quick side-by-side test seemed to imply this was minimal.
+  seeds = tf.random.experimental.stateless_split(
+      [FLAGS.seed, FLAGS.seed + 1], 2)[:, 0]
   train_builder = ub.datasets.get(
       FLAGS.dataset,
       data_dir=data_dir,
       download_data=FLAGS.download_data,
       split=tfds.Split.TRAIN,
-      validation_percent=1. - FLAGS.train_proportion)
+      seed=seeds[0],
+      aug_params=aug_params,
+      validation_percent=1. - FLAGS.train_proportion,)
   train_dataset = train_builder.load(batch_size=batch_size)
-  train_dataset = strategy.experimental_distribute_dataset(train_dataset)
-
   validation_dataset = None
   steps_per_validation = 0
   if FLAGS.train_proportion < 1.0:
     validation_builder = ub.datasets.get(
         FLAGS.dataset,
-        data_dir=data_dir,
         split=tfds.Split.VALIDATION,
-        validation_percent=1. - FLAGS.train_proportion)
+        validation_percent=1. - FLAGS.train_proportion,
+        data_dir=data_dir)
     validation_dataset = validation_builder.load(batch_size=batch_size)
     validation_dataset = strategy.experimental_distribute_dataset(
         validation_dataset)
     steps_per_validation = validation_builder.num_examples // batch_size
-
   clean_test_builder = ub.datasets.get(
       FLAGS.dataset,
-      data_dir=data_dir,
-      split=tfds.Split.TEST)
+      split=tfds.Split.TEST,
+      data_dir=data_dir)
   clean_test_dataset = clean_test_builder.load(batch_size=batch_size)
   test_datasets = {
       'clean': strategy.experimental_distribute_dataset(clean_test_dataset),
   }
+
+
+  train_dataset = strategy.experimental_distribute_dataset(train_dataset)
+
   steps_per_epoch = train_builder.num_examples // batch_size
   steps_per_eval = clean_test_builder.num_examples // batch_size
   num_classes = 100 if FLAGS.dataset == 'cifar100' else 10
@@ -112,9 +222,9 @@ def main(argv):
         dataset = ub.datasets.get(
             f'{FLAGS.dataset}_corrupted',
             corruption_type=corruption_type,
-            data_dir=data_dir,
             severity=severity,
-            split=tfds.Split.TEST).load(batch_size=batch_size)
+            split=tfds.Split.TEST,
+            data_dir=data_dir).load(batch_size=batch_size)
         test_datasets[f'{corruption_type}_{severity}'] = (
             strategy.experimental_distribute_dataset(dataset))
 
@@ -122,17 +232,15 @@ def main(argv):
       os.path.join(FLAGS.output_dir, 'summaries'))
 
   with strategy.scope():
-    logging.info('Building Keras model')
-    model = ub.models.wide_resnet_batchensemble(
-        input_shape=(32, 32, 3),
-        depth=28,
-        width_multiplier=FLAGS.width_multiplier,
+    logging.info('Building ResNet model')
+    model = ub.models.ResNetEnsemble(
+        resnet_depth=FLAGS.resnet_depth,
+        pretrained=FLAGS.pretrained_resnet,
         num_classes=num_classes,
-        ensemble_size=FLAGS.ensemble_size,
-        random_sign_init=FLAGS.random_sign_init,
-        l2=FLAGS.l2)
-    logging.info('Model input shape: %s', model.input_shape)
-    logging.info('Model output shape: %s', model.output_shape)
+        l2=FLAGS.l2,
+        ensemble_size=FLAGS.ensemble_size)
+
+    model.build([batch_size, FLAGS.ensemble_size,28, 28, 3])
     logging.info('Model number of weights: %s', model.count_params())
     # Linearly scale learning rate and the decay epochs by vanilla settings.
     base_lr = FLAGS.base_learning_rate * batch_size / 128
@@ -148,17 +256,21 @@ def main(argv):
                                         momentum=1.0 - FLAGS.one_minus_momentum,
                                         nesterov=True)
     metrics = {
-        'train/negative_log_likelihood': tf.keras.metrics.Mean(),
-        'train/accuracy': tf.keras.metrics.SparseCategoricalAccuracy(),
-        'train/loss': tf.keras.metrics.Mean(),
-        'train/ece': rm.metrics.ExpectedCalibrationError(
-            num_bins=FLAGS.num_bins),
-        'test/negative_log_likelihood': tf.keras.metrics.Mean(),
-        'test/accuracy': tf.keras.metrics.SparseCategoricalAccuracy(),
-        'test/ece': rm.metrics.ExpectedCalibrationError(
-            num_bins=FLAGS.num_bins),
+        'train/negative_log_likelihood':
+            tf.keras.metrics.Mean(),
+        'train/accuracy':
+            tf.keras.metrics.SparseCategoricalAccuracy(),
+        'train/loss':
+            tf.keras.metrics.Mean(),
+        'train/ece':
+            rm.metrics.ExpectedCalibrationError(num_bins=FLAGS.num_bins),
+        'test/negative_log_likelihood':
+            tf.keras.metrics.Mean(),
+        'test/accuracy':
+            tf.keras.metrics.SparseCategoricalAccuracy(),
+        'test/ece':
+            rm.metrics.ExpectedCalibrationError(num_bins=FLAGS.num_bins),
     }
-    eval_dataset_splits = ['test']
     if validation_dataset:
       metrics.update({
           'validation/negative_log_likelihood': tf.keras.metrics.Mean(),
@@ -166,14 +278,6 @@ def main(argv):
           'validation/ece': rm.metrics.ExpectedCalibrationError(
               num_bins=FLAGS.num_bins),
       })
-      eval_dataset_splits += ['validation']
-    for i in range(FLAGS.ensemble_size):
-      for dataset_split in eval_dataset_splits:
-        metrics[f'{dataset_split}/nll_member_{i}'] = tf.keras.metrics.Mean()
-        metrics[f'{dataset_split}/accuracy_member_{i}'] = (
-            tf.keras.metrics.SparseCategoricalAccuracy())
-        metrics[f'{dataset_split}/disagreement_{i}'] = (
-            tf.keras.metrics.SparseCategoricalAccuracy())
     if FLAGS.corruptions_interval > 0:
       corrupt_metrics = {}
       for intensity in range(1, 6):
@@ -203,36 +307,34 @@ def main(argv):
       """Per-Replica StepFn."""
       images = inputs['features']
       labels = inputs['labels']
-      images = tf.tile(images, [FLAGS.ensemble_size, 1, 1, 1])
       labels = tf.tile(labels, [FLAGS.ensemble_size])
 
+      if FLAGS.augmix and FLAGS.aug_count >= 1:
+        # Index 0 at augmix processing is the unperturbed image.
+        # We take just 1 augmented image from the returned augmented images.
+        images = images[:, 1, ...]
       with tf.GradientTape() as tape:
         logits = model(images, training=True)
-        negative_log_likelihood = tf.reduce_mean(
-            tf.keras.losses.sparse_categorical_crossentropy(labels,
-                                                            logits,
-                                                            from_logits=True))
+        if FLAGS.label_smoothing == 0.:
+          negative_log_likelihood = tf.reduce_mean(
+              tf.keras.losses.sparse_categorical_crossentropy(labels,
+                                                              logits,
+                                                              from_logits=True))
+        else:
+          one_hot_labels = tf.one_hot(tf.cast(labels, tf.int32), num_classes)
+          negative_log_likelihood = tf.reduce_mean(
+              tf.keras.losses.categorical_crossentropy(
+                  one_hot_labels,
+                  logits,
+                  from_logits=True,
+                  label_smoothing=FLAGS.label_smoothing))
         l2_loss = sum(model.losses)
         loss = negative_log_likelihood + l2_loss
         # Scale the loss given the TPUStrategy will reduce sum all gradients.
         scaled_loss = loss / strategy.num_replicas_in_sync
 
       grads = tape.gradient(scaled_loss, model.trainable_variables)
-
-      # Separate learning rate implementation.
-      if FLAGS.fast_weight_lr_multiplier != 1.0:
-        grads_and_vars = []
-        for grad, var in zip(grads, model.trainable_variables):
-          # Apply different learning rate on the fast weight approximate
-          # posterior/prior parameters. This is excludes BN and slow weights,
-          # but pay caution to the naming scheme.
-          if ('batch_norm' not in var.name and 'kernel' not in var.name):
-            grads_and_vars.append((grad * FLAGS.fast_weight_lr_multiplier, var))
-          else:
-            grads_and_vars.append((grad, var))
-        optimizer.apply_gradients(grads_and_vars)
-      else:
-        optimizer.apply_gradients(zip(grads, model.trainable_variables))
+      optimizer.apply_gradients(zip(grads, model.trainable_variables))
 
       probs = tf.nn.softmax(logits)
       metrics['train/ece'].add_batch(probs, label=labels)
@@ -251,27 +353,12 @@ def main(argv):
       """Per-Replica StepFn."""
       images = inputs['features']
       labels = inputs['labels']
-      images = tf.tile(images, [FLAGS.ensemble_size, 1, 1, 1])
       logits = model(images, training=False)
       probs = tf.nn.softmax(logits)
-      per_probs = tf.split(probs,
-                           num_or_size_splits=FLAGS.ensemble_size,
-                           axis=0)
-      for i in range(FLAGS.ensemble_size):
-        member_probs = per_probs[i]
-        member_loss = tf.keras.losses.sparse_categorical_crossentropy(
-            labels, member_probs)
-        metrics[f'{dataset_split}/nll_member_{i}'].update_state(member_loss)
-        metrics[f'{dataset_split}/accuracy_member_{i}'].update_state(
-            labels, member_probs)
-      reference_labels = tf.argmax(per_probs[0],axis=1)
-      for i in range(1,FLAGS.ensemble_size):
-          member_probs = per_probs[i]
-          metrics[f'{dataset_split}/disagreement_{i}'].update_state(reference_labels, member_probs)
 
-      probs = tf.reduce_mean(per_probs, axis=0)
       negative_log_likelihood = tf.reduce_mean(
           tf.keras.losses.sparse_categorical_crossentropy(labels, probs))
+
       if dataset_name == 'clean':
         metrics[f'{dataset_split}/negative_log_likelihood'].update_state(
             negative_log_likelihood)
@@ -288,48 +375,53 @@ def main(argv):
     for _ in tf.range(tf.cast(num_steps, tf.int32)):
       strategy.run(step_fn, args=(next(iterator),))
 
+  @tf.function
+  def cifar10h_test_step(iterator, num_steps):
+    """Evaluation StepFn."""
+    def step_fn(inputs):
+      """Per-Replica StepFn."""
+      images = inputs['features']
+      labels = inputs['labels']
+      logits = model(images, training=False)
+
+      negative_log_likelihood = tf.keras.losses.CategoricalCrossentropy(
+          from_logits=True,
+          reduction=tf.keras.losses.Reduction.NONE)(labels, logits)
+
+      negative_log_likelihood = tf.reduce_mean(negative_log_likelihood)
+      metrics['cifar10h/nll'].update_state(negative_log_likelihood)
+
+      label_diversity, sample_diversity, ged = _generalized_energy_distance(
+          labels, tf.nn.softmax(logits), 10)
+
+      metrics['cifar10h/ged'].update_state(ged)
+      metrics['cifar10h/ged_label_diversity'].update_state(
+          tf.reduce_mean(label_diversity))
+      metrics['cifar10h/ged_sample_diversity'].update_state(
+          tf.reduce_mean(sample_diversity))
+
+    for _ in tf.range(tf.cast(num_steps, tf.int32)):
+      strategy.run(step_fn, args=(next(iterator),))
+
   metrics.update({'test/ms_per_example': tf.keras.metrics.Mean()})
+  metrics.update({'train/ms_per_example': tf.keras.metrics.Mean()})
 
   train_iterator = iter(train_dataset)
   start_time = time.time()
-
-  datasets_to_evaluate = {'clean': test_datasets['clean']}
-  if (FLAGS.corruptions_interval > 0 and
-      (epoch + 1) % FLAGS.corruptions_interval == 0):
-    datasets_to_evaluate = test_datasets
-  for dataset_name, test_dataset in datasets_to_evaluate.items():
-    test_iterator = iter(test_dataset)
-    logging.info('Testing on dataset %s', dataset_name)
-    test_start_time = time.time()
-    test_step(test_iterator, 'test', dataset_name, steps_per_eval)
-    ms_per_example = (time.time() - test_start_time) * 1e6 / batch_size
-    metrics['test/ms_per_example'].update_state(ms_per_example)
-
-    logging.info('Done with testing on %s', dataset_name)
-
-  corrupt_results = {}
-  if (FLAGS.corruptions_interval > 0 and
-      (epoch + 1) % FLAGS.corruptions_interval == 0):
-    corrupt_results = utils.aggregate_corrupt_metrics(corrupt_metrics,
-                                                      corruption_types)
-
-  logging.info('Train Loss: %.4f, Accuracy: %.2f%%',
-               metrics['train/loss'].result(),
-               metrics['train/accuracy'].result() * 100)
-  logging.info('Test NLL: %.4f, Accuracy: %.2f%%',
-               metrics['test/negative_log_likelihood'].result(),
-               metrics['test/accuracy'].result() * 100)
-  for i in range(FLAGS.ensemble_size):
-      logging.info('Member %d Test Loss: %.4f, Accuracy: %.2f%%, Disagreement: %.2f Diversity: %.2f',
-                 i, metrics['test/nll_member_{}'.format(i)].result(),
-                 metrics['test/accuracy_member_{}'.format(i)].result() * 100,
-                 (1. - metrics['test/disagreement_{}'.format(i)].result()),
-                 (1. - metrics['test/disagreement_{}'.format(i)].result())/(1. - metrics['test/accuracy_member_{}'.format(i)].result()))
-
-
+  tb_callback = None
+  if FLAGS.collect_profile:
+    tb_callback = tf.keras.callbacks.TensorBoard(
+        profile_batch=(100, 102),
+        log_dir=os.path.join(FLAGS.output_dir, 'logs'))
+    tb_callback.set_model(model)
   for epoch in range(initial_epoch, FLAGS.train_epochs):
     logging.info('Starting to run epoch: %s', epoch)
+    if tb_callback:
+      tb_callback.on_epoch_begin(epoch)
+    train_start_time = time.time()
     train_step(train_iterator)
+    ms_per_example = (time.time() - train_start_time) * 1e6 / batch_size
+    metrics['train/ms_per_example'].update_state(ms_per_example)
 
     current_step = (epoch + 1) * steps_per_epoch
     max_steps = steps_per_epoch * FLAGS.train_epochs
@@ -345,6 +437,8 @@ def main(argv):
                    eta_seconds / 60,
                    time_elapsed / 60))
     logging.info(message)
+    if tb_callback:
+      tb_callback.on_epoch_end(epoch)
 
     if validation_dataset:
       validation_iterator = iter(validation_dataset)
@@ -359,6 +453,7 @@ def main(argv):
       logging.info('Testing on dataset %s', dataset_name)
       logging.info('Starting to run eval at epoch: %s', epoch)
       test_start_time = time.time()
+      1/0
       test_step(test_iterator, 'test', dataset_name, steps_per_eval)
       ms_per_example = (time.time() - test_start_time) * 1e6 / batch_size
       metrics['test/ms_per_example'].update_state(ms_per_example)
@@ -377,10 +472,6 @@ def main(argv):
     logging.info('Test NLL: %.4f, Accuracy: %.2f%%',
                  metrics['test/negative_log_likelihood'].result(),
                  metrics['test/accuracy'].result() * 100)
-    for i in range(FLAGS.ensemble_size):
-      logging.info('Member %d Test Loss: %.4f, Accuracy: %.2f%%',
-                   i, metrics['test/nll_member_{}'.format(i)].result(),
-                   metrics['test/accuracy_member_{}'.format(i)].result() * 100)
     total_results = {name: metric.result() for name, metric in metrics.items()}
     total_results.update(corrupt_results)
     # Metrics from Robustness Metrics (like ECE) will return a dict with a
@@ -410,8 +501,6 @@ def main(argv):
         'base_learning_rate': FLAGS.base_learning_rate,
         'one_minus_momentum': FLAGS.one_minus_momentum,
         'l2': FLAGS.l2,
-        'random_sign_init': FLAGS.random_sign_init,
-        'fast_weight_lr_multiplier': FLAGS.fast_weight_lr_multiplier,
     })
 
 

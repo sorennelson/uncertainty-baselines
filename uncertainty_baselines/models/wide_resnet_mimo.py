@@ -15,7 +15,7 @@
 
 """Wide ResNet architecture with multiple input and outputs."""
 import functools
-from edward2.experimental.mimo import layers
+#from edward2.experimental.mimo import layers
 import tensorflow as tf
 
 BatchNormalization = functools.partial(  # pylint: disable=invalid-name
@@ -29,6 +29,55 @@ Conv2D = functools.partial(  # pylint: disable=invalid-name
     use_bias=False,
     kernel_initializer='he_normal')
 
+
+
+class DenseMultihead(tf.keras.layers.Dense):
+  """Multiheaded output layer."""
+
+  def __init__(self,
+               units,
+               ensemble_size=1,
+               activation=None,
+               use_bias=True,
+               kernel_initializer='glorot_uniform',
+               bias_initializer='zeros',
+               kernel_regularizer=None,
+               bias_regularizer=None,
+               activity_regularizer=None,
+               kernel_constraint=None,
+               bias_constraint=None,
+               **kwargs):
+    super().__init__(
+        units=units * ensemble_size,
+        activation=activation,
+        use_bias=use_bias,
+        kernel_initializer=kernel_initializer,
+        bias_initializer=bias_initializer,
+        kernel_regularizer=kernel_regularizer,
+        bias_regularizer=bias_regularizer,
+        activity_regularizer=activity_regularizer,
+        kernel_constraint=kernel_constraint,
+        bias_constraint=bias_constraint,
+        **kwargs)
+    self.ensemble_size = ensemble_size
+
+  def call(self, inputs):
+    batch_size = tf.shape(inputs)[0]
+    # NOTE: This restricts this layer from being called on tensors of ndim > 2.
+    outputs = super().call(inputs)
+    outputs = tf.reshape(outputs, [batch_size,
+                                   self.ensemble_size,
+                                   self.units // self.ensemble_size])
+    return outputs
+
+  def get_config(self):
+    config = {
+        'units': self.units // self.ensemble_size,
+        'ensemble_size': self.ensemble_size,
+    }
+    new_config = super().get_config()
+    new_config.update(config)
+    return new_config
 
 def basic_block(inputs, filters, strides):
   """Basic residual block of two 3x3 convs."""
@@ -100,7 +149,7 @@ def wide_resnet_mimo(input_shape, depth, width_multiplier, num_classes,
   x = tf.keras.layers.Activation('relu')(x)
   x = tf.keras.layers.AveragePooling2D(pool_size=8)(x)
   x = tf.keras.layers.Flatten()(x)
-  x = layers.DenseMultihead(
+  x = DenseMultihead(
       num_classes,
       kernel_initializer='he_normal',
       activation=None,

@@ -139,30 +139,41 @@ class _CifarDataset(base.BaseDataset):
     def _example_parser(example: types.Features) -> types.Features:
       """A pre-process function to return images in [0, 1]."""
       image = example['image']
+      unaugmented_image = image
       image_dtype = tf.bfloat16 if self._use_bfloat16 else tf.float32
       use_augmix = self._aug_params.get('augmix', False)
+      num_augs = self._aug_params.get('aug_count',1)
+      # Note that self._seed will already be shape (2,), as is required for
+      # stateless random ops, and so will per_example_step_seed.
+      per_example_step_seed = tf.random.experimental.stateless_fold_in(
+          self._seed, example[self._enumerate_id_key])
+      # per_example_step_seeds will be of size (num, 3).
+      # First for random_crop, second for flip, third optionally for
+      # RandAugment, and foruth optionally for Augmix.
+      per_example_step_seeds = tf.random.experimental.stateless_split(
+          per_example_step_seed, num=4)
       if self._is_training:
-        image_shape = tf.shape(image)
-        # Expand the image by 2 pixels, then crop back down to 32x32.
-        image = tf.image.resize_with_crop_or_pad(
-            image, image_shape[0] + 4, image_shape[1] + 4)
-        # Note that self._seed will already be shape (2,), as is required for
-        # stateless random ops, and so will per_example_step_seed.
-        per_example_step_seed = tf.random.experimental.stateless_fold_in(
-            self._seed, example[self._enumerate_id_key])
-        # per_example_step_seeds will be of size (num, 3).
-        # First for random_crop, second for flip, third optionally for
-        # RandAugment, and foruth optionally for Augmix.
-        per_example_step_seeds = tf.random.experimental.stateless_split(
-            per_example_step_seed, num=4)
-        image = tf.image.stateless_random_crop(
-            image,
-            (image_shape[0], image_shape[0], 3),
-            seed=per_example_step_seeds[0])
-        image = tf.image.stateless_random_flip_left_right(
-            image,
-            seed=per_example_step_seeds[1])
+        augmented_samples = []
+        for i in range(num_augs):
+          image = unaugmented_image
+          image_shape = tf.shape(image)
+          # Expand the image by 2 pixels, then crop back down to 32x32.
+          image = tf.image.resize_with_crop_or_pad(
+              image, image_shape[0] + 4, image_shape[1] + 4)
 
+          crop_seed = tf.random.experimental.stateless_fold_in(per_example_step_seeds[0],i)
+          image = tf.image.stateless_random_crop(
+              image,
+              (image_shape[0], image_shape[0], 3),
+              seed=crop_seed)
+          flip_seed =  tf.random.experimental.stateless_fold_in(per_example_step_seeds[1],i)
+          image = tf.image.stateless_random_flip_left_right(
+              image,
+              seed=flip_seed)
+          augmented_samples.append(image)
+
+        image = tf.stack(augmented_samples)
+        image = tf.squeeze(image)
         # Only random augment for now.
         if self._aug_params.get('random_augment', False):
           count = self._aug_params['aug_count']

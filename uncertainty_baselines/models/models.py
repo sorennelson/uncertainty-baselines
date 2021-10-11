@@ -30,6 +30,7 @@ from uncertainty_baselines.models import movielens
 from uncertainty_baselines.models import resnet20
 from uncertainty_baselines.models import textcnn
 from uncertainty_baselines.models import wide_resnet
+from uncertainty_baselines.models import resnet_ensemble
 
 try:
   from uncertainty_baselines.models import bert  # pylint: disable=g-import-not-at-top

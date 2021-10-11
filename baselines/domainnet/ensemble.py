@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Ensemble on CIFAR.
+"""Ensemble on DomainNet.
 
 This script only performs evaluation, not training. We recommend training
 ensembles by launching independent runs of `deterministic.py` over different
@@ -38,9 +38,9 @@ from classification_models.tfkeras import Classifiers
 
 flags.DEFINE_string('checkpoint_dir', None,
                     'The directory where the model weights are stored.')
+flags.DEFINE_string('domain', 'real', 'selected domain')
 flags.mark_flag_as_required('checkpoint_dir')
 flags.DEFINE_bool('resnet_18', False, 'Whether to use ResNet 18')
-flags.DEFINE_bool('no_corrupt', False, 'Whether to test cifarc')
 
 FLAGS = flags.FLAGS
 
@@ -68,36 +68,31 @@ def main(argv):
   tf.random.set_seed(FLAGS.seed)
   tf.io.gfile.makedirs(FLAGS.output_dir)
 
-  ds_info = tfds.builder(FLAGS.dataset).info
   batch_size = FLAGS.per_core_batch_size * FLAGS.num_cores
-  steps_per_eval = ds_info.splits['test'].num_examples // batch_size
-  num_classes = ds_info.features['label'].num_classes
+  num_classes = 345
+
+  count_dataset = ub.datasets.get(
+      'domainnet',
+      domain=FLAGS.domain,
+      data_dir=FLAGS.data_dir,
+      download_data=FLAGS.download_data,
+      split=tfds.Split.TEST).load(batch_size=1)
+
+  test_dataset_size = sum(1 for _ in iter(count_dataset))
+
+  steps_per_eval = test_dataset_size // batch_size
 
   dataset = ub.datasets.get(
-      FLAGS.dataset,
+      'domainnet',
+      domain=FLAGS.domain,
+      data_dir=FLAGS.data_dir,
       download_data=FLAGS.download_data,
       split=tfds.Split.TEST).load(batch_size=batch_size)
   test_datasets = {'clean': dataset}
-  if FLAGS.no_corrupt:
-    corruption_types = []
-  else:
-    corruption_types, _ = utils.load_corrupted_test_info(FLAGS.dataset)
-  for corruption_type in corruption_types:
-    for severity in range(1, 6):
-      dataset = ub.datasets.get(
-          f'{FLAGS.dataset}_corrupted',
-          corruption_type=corruption_type,
-          data_dir = FLAGS.data_dir,
-          download_data=FLAGS.download_data,
-          severity=severity,
-          split=tfds.Split.TEST).load(batch_size=batch_size)
-      test_datasets[f'{corruption_type}_{severity}'] = dataset
   if FLAGS.resnet_18:
     ResNet18, preprocess_input = Classifiers.get('resnet18')
-    inputs = tf.keras.layers.Input((32,32,3))
-    reshaped_inputs = tf.image.resize(inputs, [224,224], method='bicubic')
-    rescaled_inputs = reshaped_inputs * 255.
-    resnet_trunk = ResNet18((224, 224, 3), l2=FLAGS.l2, weights=None, include_top=False)(rescaled_inputs)
+    inputs = tf.keras.layers.Input((224,224,3))
+    resnet_trunk = ResNet18((224, 224, 3), l2=FLAGS.l2, weights=None, include_top=False)(inputs)
     pooled_resnet = tf.keras.layers.GlobalAveragePooling2D()(resnet_trunk)
     output = tf.keras.layers.Dense(num_classes, kernel_initializer=tf.keras.initializers.HeNormal(),
           kernel_regularizer=tf.keras.regularizers.l2(FLAGS.l2),
@@ -221,10 +216,7 @@ def main(argv):
         (n + 1) / num_datasets, n + 1, num_datasets))
     logging.info(message)
 
-  corrupt_results = utils.aggregate_corrupt_metrics(corrupt_metrics,
-                                                    corruption_types)
   total_results = {name: metric.result() for name, metric in metrics.items()}
-  total_results.update(corrupt_results)
   # Results from Robustness Metrics themselves return a dict, so flatten them.
   total_results = utils.flatten_dictionary(total_results)
   logging.info('Metrics: %s', total_results)

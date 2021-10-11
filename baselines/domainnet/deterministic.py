@@ -13,16 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Wide ResNet 28-10 on CIFAR-10/100 trained with maximum likelihood.
-
-Hyperparameters differ slightly from the original paper's code
-(https://github.com/szagoruyko/wide-residual-networks) as TensorFlow uses, for
-example, l2 instead of weight decay, and a different parameterization for SGD's
-momentum.
-"""
 
 import os
-import random
 import time
 from absl import app
 from absl import flags
@@ -79,10 +71,11 @@ flags.DEFINE_float('dense_bias_l2', None,
 flags.DEFINE_bool('collect_profile', False,
                   'Whether to trace a profile with tensorboard')
 
-flags.DEFINE_bool('resnet', False, 'Whether to use ResNet')
-flags.DEFINE_bool('pretrained_resnet', False, 'Whether to use Pretrained ResNet')
-flags.DEFINE_string('resnet_depth','18','Depth of resnet')
+flags.DEFINE_bool('resnet_18', False, 'Whether to use ResNet 18')
+flags.DEFINE_bool('pretrained_resnet_18', False, 'Whether to use Pretrained ResNet 18')
 flags.DEFINE_float('reset_prob', 0.0, 'Whether to reset weights with some probability')
+
+flags.DEFINE_bool('limit_memory', False, 'Whether to limit GPU memory.')
 flags.DEFINE_integer('reset_stage', None, 'Which block to reset')
 flags.DEFINE_integer('final_layer_reset', None, 'Resetting final layers')
 flags.DEFINE_integer('unit_2_reset', None, 'How many final units to reset.')
@@ -90,17 +83,10 @@ flags.DEFINE_integer('unit_2_reset', None, 'How many final units to reset.')
 
 FLAGS = flags.FLAGS
 
+
+
 def reinitialize_model(model, probability=0.0, reset_stage_idx=None, final_layer_reset=None, unit_2_reset=None):
-  if FLAGS.resnet_depth == '18':
-    residual_blocks = ['stage1_unit1','stage1_unit2','stage2_unit1','stage2_unit2','stage3_unit1','stage3_unit2','stage4_unit1','stage4_unit2' ]
-  elif FLAGS.resnet_depth =='34':
-    config = [3,4,6,3]
-    residual_blocks = []
-    for i, num in enumerate(config):
-        for j in range(num):
-            residual_blocks.append('stage{}_unit{}'.format(i+1, j+1))
-  else:
-    raise ValueError('Incorrect resnet depth')
+  residual_blocks = ['stage1_unit1','stage1_unit2','stage2_unit1','stage2_unit2','stage3_unit1','stage3_unit2','stage4_unit1','stage4_unit2' ]
   if reset_stage_idx is not None:
       residual_blocks = residual_blocks[reset_stage_idx:reset_stage_idx + 1]
   if final_layer_reset is not None:
@@ -131,7 +117,6 @@ def reinitialize_model(model, probability=0.0, reset_stage_idx=None, final_layer
                             layer.moving_variance_initializer]
   for w, init in zip(weights, initializers):
     w.assign(init(w.shape, dtype=w.dtype))
-
 
 def _extract_hyperparameter_dictionary():
   """Create the dictionary of hyperparameters from FLAGS."""
@@ -180,12 +165,21 @@ def main(argv):
   logging.info('Saving checkpoints at %s', FLAGS.output_dir)
   tf.random.set_seed(FLAGS.seed)
   physical_devices = tf.config.list_physical_devices('GPU')
-  try:
-    tf.config.experimental.set_memory_growth(physical_devices[0], True)
-    tf.config.experimental.set_memory_growth(physical_devices[1], True)
-  except:
-    # Invalid device or cannot modify virtual devices once initialized.
-    pass
+  if FLAGS.limit_memory:
+     try:
+        tf.config.experimental.set_virtual_device_configuration(physical_devices[0],
+                [tf.config.experimental.VirtualDeviceConfiguration(memory_limt= 12288)])
+        tf.config.experimental.set_virtual_device_configuration(physical_devices[1],
+                [tf.config.experimental.VirtualDeviceConfiguration(memory_limt= 12288)])
+     except:
+        pass
+  else:
+     try:
+       tf.config.experimental.set_memory_growth(physical_devices[0], True)
+       tf.config.experimental.set_memory_growth(physical_devices[1], True)
+     except:
+       # Invalid device or cannot modify virtual devices once initialized.
+       pass
 
   data_dir = FLAGS.data_dir
   if FLAGS.use_gpu:
@@ -199,16 +193,15 @@ def main(argv):
     tf.tpu.experimental.initialize_tpu_system(resolver)
     strategy = tf.distribute.TPUStrategy(resolver)
 
-  ds_info = tfds.builder(FLAGS.dataset).info
   batch_size = FLAGS.per_core_batch_size * FLAGS.num_cores
-  train_dataset_size = (
-      ds_info.splits['train'].num_examples * FLAGS.train_proportion)
+  train_dataset_size = 120905
+  test_dataset_size = 52041
+  #steps_per_epoch = 15
   steps_per_epoch = int(train_dataset_size / batch_size)
   logging.info('Steps per epoch %s', steps_per_epoch)
-  logging.info('Size of the dataset %s', ds_info.splits['train'].num_examples)
+  logging.info('Size of the dataset %s', train_dataset_size)
   logging.info('Train proportion %s', FLAGS.train_proportion)
-  steps_per_eval = ds_info.splits['test'].num_examples // batch_size
-  num_classes = ds_info.features['label'].num_classes
+  steps_per_eval = test_dataset_size // batch_size
 
   aug_params = {
       'augmix': FLAGS.augmix,
@@ -223,28 +216,18 @@ def main(argv):
   seeds = tf.random.experimental.stateless_split(
       [FLAGS.seed, FLAGS.seed + 1], 2)[:, 0]
   train_builder = ub.datasets.get(
-      FLAGS.dataset,
+      'domainnet',
+      domain='real',
       data_dir=data_dir,
       download_data=FLAGS.download_data,
-      split=tfds.Split.TRAIN,
-      seed=seeds[0],
-      aug_params=aug_params,
-      validation_percent=1. - FLAGS.train_proportion,)
+      shuffle_buffer_size=1000,
+      split=tfds.Split.TRAIN)
   train_dataset = train_builder.load(batch_size=batch_size)
   validation_dataset = None
-  steps_per_validation = 0
-  if FLAGS.train_proportion < 1.0:
-    validation_builder = ub.datasets.get(
-        FLAGS.dataset,
-        split=tfds.Split.VALIDATION,
-        validation_percent=1. - FLAGS.train_proportion,
-        data_dir=data_dir)
-    validation_dataset = validation_builder.load(batch_size=batch_size)
-    validation_dataset = strategy.experimental_distribute_dataset(
-        validation_dataset)
-    steps_per_validation = validation_builder.num_examples // batch_size
+  steps_per_validation = steps_per_eval
   clean_test_builder = ub.datasets.get(
-      FLAGS.dataset,
+      'domainnet',
+      domain='real',
       split=tfds.Split.TEST,
       data_dir=data_dir)
   clean_test_dataset = clean_test_builder.load(batch_size=batch_size)
@@ -255,57 +238,41 @@ def main(argv):
 
   train_dataset = strategy.experimental_distribute_dataset(train_dataset)
 
-  steps_per_epoch = train_builder.num_examples // batch_size
-  steps_per_eval = clean_test_builder.num_examples // batch_size
-  num_classes = 100 if FLAGS.dataset == 'cifar100' else 10
-  if FLAGS.corruptions_interval > 0:
-    if FLAGS.dataset == 'cifar100':
-      data_dir = FLAGS.cifar100_c_path
-    corruption_types, _ = utils.load_corrupted_test_info(FLAGS.dataset)
-    for corruption_type in corruption_types:
-      for severity in range(1, 6):
-        dataset = ub.datasets.get(
-            f'{FLAGS.dataset}_corrupted',
-            corruption_type=corruption_type,
-            severity=severity,
-            split=tfds.Split.TEST,
-            data_dir=data_dir).load(batch_size=batch_size)
-        test_datasets[f'{corruption_type}_{severity}'] = (
-            strategy.experimental_distribute_dataset(dataset))
+
+  steps_per_epoch = train_dataset_size // batch_size
+  steps_per_eval = test_dataset_size // batch_size
+  num_classes = 345
+
 
   summary_writer = tf.summary.create_file_writer(
       os.path.join(FLAGS.output_dir, 'summaries'))
 
   with strategy.scope():
     logging.info('Building ResNet model')
-    if FLAGS.resnet:
-        ResNet, preprocess_input = Classifiers.get('resnet{}'.format(FLAGS.resnet_depth))
-        inputs = tf.keras.layers.Input((32,32,3))
-        reshaped_inputs = tf.image.resize(inputs, [224,224], method='bicubic')
-        rescaled_inputs = reshaped_inputs * 255.
-        resnet_trunk = ResNet((224, 224, 3), l2=FLAGS.l2, weights=None, include_top=False)(rescaled_inputs)
+    if FLAGS.resnet_18:
+        ResNet18, preprocess_input = Classifiers.get('resnet18')
+        inputs = tf.keras.layers.Input((224,224,3))
+        resnet_trunk = ResNet18((224, 224, 3), l2=FLAGS.l2, weights=None, include_top=False)(inputs)
         pooled_resnet = tf.keras.layers.GlobalAveragePooling2D()(resnet_trunk)
         output = tf.keras.layers.Dense(num_classes, kernel_initializer=tf.keras.initializers.HeNormal(),
                 kernel_regularizer=tf.keras.regularizers.l2(FLAGS.l2),
                 bias_regularizer=tf.keras.regularizers.l2(FLAGS.l2))(pooled_resnet)
-        model = tf.keras.Model(inputs=inputs, outputs=output,name='resnet')
-    elif FLAGS.pretrained_resnet:
-        ResNet, preprocess_input = Classifiers.get('resnet{}'.format(FLAGS.resnet_depth))
-        inputs = tf.keras.layers.Input((32,32,3))
-        reshaped_inputs = tf.image.resize(inputs, [224,224], method='bicubic')
-        rescaled_inputs = reshaped_inputs * 255.
-        resnet_trunk = ResNet((224, 224, 3), l2=FLAGS.l2, weights='imagenet', include_top=False)
+        model = tf.keras.Model(inputs=inputs, outputs=output,name='pretrained_resnet_18')
+    elif FLAGS.pretrained_resnet_18:
+        ResNet18, preprocess_input = Classifiers.get('resnet18')
+        inputs = tf.keras.layers.Input((224,224,3))
+        resnet_trunk = ResNet18((224, 224, 3), l2=FLAGS.l2, weights='imagenet', include_top=False)
         if FLAGS.reset_prob > 0.0:
             reinitialize_model(resnet_trunk, probability = FLAGS.reset_prob, reset_stage_idx=FLAGS.reset_stage, final_layer_reset=FLAGS.final_layer_reset, unit_2_reset=FLAGS.unit_2_reset)
-        resnet_trunk_out = resnet_trunk(rescaled_inputs)
+        resnet_trunk_out = resnet_trunk(inputs)
         pooled_resnet = tf.keras.layers.GlobalAveragePooling2D()(resnet_trunk_out)
         output = tf.keras.layers.Dense(num_classes, kernel_initializer=tf.keras.initializers.HeNormal(),
                 kernel_regularizer=tf.keras.regularizers.l2(FLAGS.l2),
                 bias_regularizer=tf.keras.regularizers.l2(FLAGS.l2))(pooled_resnet)
-        model = tf.keras.Model(inputs=inputs, outputs=output,name='pretrained_resnet')
+        model = tf.keras.Model(inputs=inputs, outputs=output,name='pretrained_resnet_18')
     else:
         model = ub.models.wide_resnet(
-            input_shape=(32, 32, 3),
+            input_shape=(224, 224, 3),
             depth=28,
             width_multiplier=10,
             num_classes=num_classes,
@@ -352,17 +319,6 @@ def main(argv):
           'validation/ece': rm.metrics.ExpectedCalibrationError(
               num_bins=FLAGS.num_bins),
       })
-    if FLAGS.corruptions_interval > 0:
-      corrupt_metrics = {}
-      for intensity in range(1, 6):
-        for corruption in corruption_types:
-          dataset_name = '{0}_{1}'.format(corruption, intensity)
-          corrupt_metrics['test/nll_{}'.format(dataset_name)] = (
-              tf.keras.metrics.Mean())
-          corrupt_metrics['test/accuracy_{}'.format(dataset_name)] = (
-              tf.keras.metrics.SparseCategoricalAccuracy())
-          corrupt_metrics['test/ece_{}'.format(dataset_name)] = (
-              rm.metrics.ExpectedCalibrationError(num_bins=FLAGS.num_bins))
 
     checkpoint = tf.train.Checkpoint(model=model, optimizer=optimizer)
     latest_checkpoint = tf.train.latest_checkpoint(FLAGS.output_dir)
@@ -418,6 +374,7 @@ def main(argv):
 
     for _ in tf.range(tf.cast(steps_per_epoch, tf.int32)):
       strategy.run(step_fn, args=(next(iterator),))
+      print('step taken')
 
   @tf.function
   def test_step(iterator, dataset_split, dataset_name, num_steps):
@@ -445,36 +402,10 @@ def main(argv):
         corrupt_metrics['test/ece_{}'.format(dataset_name)].add_batch(
             probs, label=labels)
 
-    for _ in tf.range(tf.cast(num_steps, tf.int32)):
+    for i in tf.range(tf.cast(num_steps, tf.int32)):
+      print(i)
       strategy.run(step_fn, args=(next(iterator),))
 
-  @tf.function
-  def cifar10h_test_step(iterator, num_steps):
-    """Evaluation StepFn."""
-    def step_fn(inputs):
-      """Per-Replica StepFn."""
-      images = inputs['features']
-      labels = inputs['labels']
-      logits = model(images, training=False)
-
-      negative_log_likelihood = tf.keras.losses.CategoricalCrossentropy(
-          from_logits=True,
-          reduction=tf.keras.losses.Reduction.NONE)(labels, logits)
-
-      negative_log_likelihood = tf.reduce_mean(negative_log_likelihood)
-      metrics['cifar10h/nll'].update_state(negative_log_likelihood)
-
-      label_diversity, sample_diversity, ged = _generalized_energy_distance(
-          labels, tf.nn.softmax(logits), 10)
-
-      metrics['cifar10h/ged'].update_state(ged)
-      metrics['cifar10h/ged_label_diversity'].update_state(
-          tf.reduce_mean(label_diversity))
-      metrics['cifar10h/ged_sample_diversity'].update_state(
-          tf.reduce_mean(sample_diversity))
-
-    for _ in tf.range(tf.cast(num_steps, tf.int32)):
-      strategy.run(step_fn, args=(next(iterator),))
 
   metrics.update({'test/ms_per_example': tf.keras.metrics.Mean()})
   metrics.update({'train/ms_per_example': tf.keras.metrics.Mean()})
@@ -487,6 +418,7 @@ def main(argv):
         profile_batch=(100, 102),
         log_dir=os.path.join(FLAGS.output_dir, 'logs'))
     tb_callback.set_model(model)
+  #for epoch in range(1):
   for epoch in range(initial_epoch, FLAGS.train_epochs):
     logging.info('Starting to run epoch: %s', epoch)
     if tb_callback:

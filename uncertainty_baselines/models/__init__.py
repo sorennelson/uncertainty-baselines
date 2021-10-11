@@ -27,6 +27,7 @@ from uncertainty_baselines.models.models import get
 from uncertainty_baselines.models.movielens import movielens
 from uncertainty_baselines.models.mpnn import mpnn
 from uncertainty_baselines.models.resnet20 import resnet20
+from uncertainty_baselines.models.resnet_ensemble import ResNetEnsemble
 from uncertainty_baselines.models.resnet50_batchensemble import resnet101_batchensemble
 from uncertainty_baselines.models.resnet50_batchensemble import resnet50_batchensemble
 from uncertainty_baselines.models.resnet50_batchensemble import resnet_batchensemble
@@ -42,7 +43,7 @@ from uncertainty_baselines.models.resnet50_sngp import resnet50_sngp_add_last_la
 from uncertainty_baselines.models.resnet50_sngp_be import resnet50_sngp_be
 from uncertainty_baselines.models.resnet50_variational import resnet50_variational
 from uncertainty_baselines.models.textcnn import textcnn
-from uncertainty_baselines.models.vit_heteroscedastic import het_vision_transformer
+#from uncertainty_baselines.models.vit_heteroscedastic import het_vision_transformer
 from uncertainty_baselines.models.wide_resnet import wide_resnet
 from uncertainty_baselines.models.wide_resnet_batchensemble import wide_resnet_batchensemble
 from uncertainty_baselines.models.wide_resnet_condconv import wide_resnet_condconv
@@ -51,6 +52,7 @@ from uncertainty_baselines.models.wide_resnet_heteroscedastic import wide_resnet
 from uncertainty_baselines.models.wide_resnet_hyperbatchensemble import e_factory as hyperbatchensemble_e_factory
 from uncertainty_baselines.models.wide_resnet_hyperbatchensemble import LambdaConfig as HyperBatchEnsembleLambdaConfig
 from uncertainty_baselines.models.wide_resnet_hyperbatchensemble import wide_resnet_hyperbatchensemble
+from uncertainty_baselines.models.wide_resnet_mimo import wide_resnet_mimo
 from uncertainty_baselines.models.wide_resnet_rank1 import wide_resnet_rank1
 from uncertainty_baselines.models.wide_resnet_sngp import wide_resnet_sngp
 from uncertainty_baselines.models.wide_resnet_sngp_be import wide_resnet_sngp_be
@@ -60,11 +62,12 @@ from uncertainty_baselines.models.wide_resnet_variational import wide_resnet_var
 
 # pylint: disable=g-import-not-at-top
 try:
+  pass
   # Try to import ViT models.
-  from uncertainty_baselines.models import vit_batchensemble
-  from uncertainty_baselines.models.vit import vision_transformer
-  from uncertainty_baselines.models.vit_batchensemble import PatchTransformerBE
-  from uncertainty_baselines.models.vit_gp import vision_transformer_gp
+  #from uncertainty_baselines.models import vit_batchensemble
+  #from uncertainty_baselines.models.vit import vision_transformer
+  #from uncertainty_baselines.models.vit_batchensemble import PatchTransformerBE
+  #from uncertainty_baselines.models.vit_gp import vision_transformer_gp
 except ImportError:
   logging.warning('Skipped ViT models due to ImportError.', exc_info=True)
 except tf.errors.NotFoundError:
