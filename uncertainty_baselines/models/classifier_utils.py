@@ -23,13 +23,15 @@ import tensorflow as tf
 
 def build_classifier(num_classes: int,
                      gp_layer_kwargs: Dict[str, Any],
-                     use_gp_layer: bool = False) -> tf.keras.Model:
+                     use_gp_layer: bool = False,
+                     kernel_regularizer=None) -> tf.keras.Model:
   """Builds a classifier.
 
   Args:
     num_classes: Number of output classes.
     gp_layer_kwargs: Dict of parameters used in Gaussian Process layer.
     use_gp_layer: Bool, if set True, GP layer is used to build classifier.
+    kernel_regularizer: Regularization function for Dense classifider.
 
   Returns:
     A Keras Layer producing classification logits.
@@ -45,6 +47,7 @@ def build_classifier(num_classes: int,
             tf.keras.initializers.RandomNormal(mean=0.0, stddev=0.05)),
         **gp_layer_kwargs)
   else:
-    classifier = tf.keras.layers.Dense(num_classes)
+    classifier = tf.keras.layers.Dense(
+        num_classes, kernel_regularizer=kernel_regularizer)
 
   return classifier
