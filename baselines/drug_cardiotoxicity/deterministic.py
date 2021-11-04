@@ -48,7 +48,7 @@ flags.DEFINE_integer('batch_size', 128, 'Batch size.')
 flags.DEFINE_integer('num_epochs', 200, 'Number of epochs.')
 flags.DEFINE_boolean('use_gpu', True, 'If True, uses GPU.')
 flags.DEFINE_integer('num_cores', 1, 'Number of TPU cores or number of GPUs.')
-flags.DEFINE_string('master', '', 'TPU master.')
+flags.DEFINE_string('tpu', '', 'TPU master.')
 # Parameter flags.
 flags.DEFINE_integer('seed', 42, 'Random seed.')
 flags.DEFINE_float('learning_rate', 0.001, 'Learning rate.')
@@ -131,7 +131,9 @@ def train_step(model, strategy, iterator, steps_per_epoch, optimizer, metrics,
         loss = focal_loss + l2_loss
       else:
         loss = negative_log_likelihood + l2_loss
-      # Scale the loss given the TPUStrategy will reduce sum all gradients.
+      # Scale the loss given the tf.distribute.Strategy will reduce sum all
+      # gradients. See details in
+      # https://www.tensorflow.org/tutorials/distribute/custom_training#define_the_loss_function
       scaled_loss = loss / strategy.num_replicas_in_sync
 
     grads = tape.gradient(scaled_loss, model.trainable_variables)
@@ -150,7 +152,7 @@ def train_step(model, strategy, iterator, steps_per_epoch, optimizer, metrics,
 
 
 @tf.function
-def eval_step(model, iterator, dataset_name, num_steps, metrics):
+def eval_step(model, strategy, iterator, dataset_name, num_steps, metrics):
   """Evaluation StepFn."""
 
   def step_fn(model, inputs, dataset_name, metrics):
@@ -173,7 +175,9 @@ def eval_step(model, iterator, dataset_name, num_steps, metrics):
     metrics[f'{dataset_name}/brier'].add_batch(probs, label=labels[:, 1])
 
   for _ in tf.range(tf.cast(num_steps, tf.int32)):
-    step_fn(model, next(iterator), dataset_name, metrics)
+    strategy.run(
+        step_fn,
+        args=(model, next(iterator), dataset_name, metrics))
 
 
 def get_metric_result_value(metric):
@@ -222,6 +226,14 @@ def run(train_dataset: tf.data.Dataset, eval_datasets: Dict[str,
         num_bins=ece_num_bins)
     metrics[f'{dataset_name}/brier'] = rm.metrics.Brier()
 
+  # Makes datasets into distributed version.
+  train_dataset = strategy.experimental_distribute_dataset(train_dataset)
+  eval_datasets = {
+      ds_name: strategy.experimental_distribute_dataset(ds)
+      for ds_name, ds in eval_datasets.items()
+  }
+  logging.info('Number of replicas in sync: %s', strategy.num_replicas_in_sync)
+
   train_iterator = iter(train_dataset)
   start_time = time.time()
   metrics_history = collections.defaultdict(list)
@@ -245,7 +257,7 @@ def run(train_dataset: tf.data.Dataset, eval_datasets: Dict[str,
     logging.info('Starting to run eval at epoch: %s', epoch)
     for dataset_name, eval_dataset in eval_datasets.items():
       eval_iterator = iter(eval_dataset)
-      eval_step(model, eval_iterator, dataset_name,
+      eval_step(model, strategy, eval_iterator, dataset_name,
                 steps_per_eval[dataset_name], metrics)
 
     metrics_history['epoch'].append(epoch + 1)
@@ -274,9 +286,11 @@ def main(argv: Sequence[str]):
   tf.random.set_seed(FLAGS.seed)
 
   if not FLAGS.use_gpu:
-    strategy = get_tpu_strategy(FLAGS.master)
+    logging.info('Using TPU for training.')
+    strategy = get_tpu_strategy(FLAGS.tpu)
   else:
-    strategy = tf.distribute.OneDeviceStrategy(device='/cpu:0')
+    logging.info('Using GPU for training.')
+    strategy = tf.distribute.MirroredStrategy()
 
   train_dataset_builder = DrugCardiotoxicityDataset(
       split=tfds.Split.TRAIN,
