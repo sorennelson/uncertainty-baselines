@@ -372,7 +372,7 @@ class _DialogStateTrackingDataset(base.BaseDataset):
 class SimDialDataset(_DialogStateTrackingDataset):
   """SimDial dataset builder class."""
 
-  def __init__(self, data_dir=None, **kwargs):
+  def __init__(self, data_dir=None, load_domain_label=True, **kwargs):
     super().__init__(name='simdial', data_dir=data_dir, **kwargs)
 
 
