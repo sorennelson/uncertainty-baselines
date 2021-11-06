@@ -82,9 +82,38 @@ flags.DEFINE_bool('collect_profile', False,
 flags.DEFINE_bool('pretrained_resnet', False, 'Whether to use Pretrained ResNet')
 flags.DEFINE_string('resnet_depth','18','Depth of resnet')
 flags.DEFINE_integer('ensemble_size', 1, 'Ensemble size')
+flags.DEFINE_float('diversity_loss_temperature',5.0,'Diversity loss temp')
+flags.DEFINE_float('diversity_loss_weight',0.0,'Weight of diversity loss')
+flags.DEFINE_string('reset_stage_list',None,'List of stages to reset')
 
 
 FLAGS = flags.FLAGS
+
+
+def diversity_loss(logits,labels):
+  """Diversity loss from Dvornik et. al."""
+  if FLAGS.ensemble_size < 2:
+      return 0.0
+  logits_per_member = tf.split(logits,FLAGS.ensemble_size)
+  labels_per_member = tf.split(labels,FLAGS.ensemble_size)
+  batch_size = logits_per_member[0].shape[0]
+  num_classes = logits_per_member[0].shape[1]
+  logits_stacked = tf.stack(logits_per_member,axis=-1)
+  all_probs = tf.nn.softmax(logits_stacked/FLAGS.diversity_loss_temperature,axis=1)
+  #label_inds = tf.ones((batch_size,num_classes))
+  #label_inds[range(batch_size),labels_per_member[0]] = 0
+  label_inds = 1.0 -  tf.one_hot(tf.cast(labels_per_member[0],tf.int32), num_classes)
+
+  #Removing gt prob
+  probs = all_probs * tf.expand_dims(label_inds,axis=-1)
+  probs = probs / (tf.reduce_sum(probs,axis=1, keepdims=True) + 1e-8)
+
+  probs = tf.math.l2_normalize(probs, axis=1)
+  cov_mat = tf.einsum('ijk,ijl->ikl',probs,probs)
+  pairwise_inds = 1 - tf.eye(FLAGS.ensemble_size)
+  den = batch_size * (FLAGS.ensemble_size - 1) * FLAGS.ensemble_size
+  loss = tf.reduce_sum(cov_mat * pairwise_inds) / den
+  return loss
 
 
 
@@ -172,6 +201,9 @@ def main(argv):
       'augmix_prob_coeff': FLAGS.augmix_prob_coeff,
       'augmix_width': FLAGS.augmix_width,
   }
+  aug_params_test = {
+          'ensemble_size': FLAGS.ensemble_size
+  }
 
   # Note that stateless_{fold_in,split} may incur a performance cost, but a
   # quick side-by-side test seemed to imply this was minimal.
@@ -201,6 +233,7 @@ def main(argv):
   clean_test_builder = ub.datasets.get(
       FLAGS.dataset,
       split=tfds.Split.TEST,
+      aug_params= aug_params_test,
       data_dir=data_dir)
   clean_test_dataset = clean_test_builder.load(batch_size=batch_size)
   test_datasets = {
@@ -233,12 +266,17 @@ def main(argv):
 
   with strategy.scope():
     logging.info('Building ResNet model')
+    if FLAGS.reset_stage_list is not None:
+        reset_stage_list = FLAGS.reset_stage_list.split(',')
+    else:
+        reset_stage_list = None
     model = ub.models.ResNetEnsemble(
         resnet_depth=FLAGS.resnet_depth,
         pretrained=FLAGS.pretrained_resnet,
         num_classes=num_classes,
         l2=FLAGS.l2,
-        ensemble_size=FLAGS.ensemble_size)
+        ensemble_size=FLAGS.ensemble_size,
+        reset_stage_list=reset_stage_list)
 
     model.build([batch_size, FLAGS.ensemble_size,28, 28, 3])
     logging.info('Model number of weights: %s', model.count_params())
@@ -329,9 +367,11 @@ def main(argv):
                   from_logits=True,
                   label_smoothing=FLAGS.label_smoothing))
         l2_loss = sum(model.losses)
-        loss = negative_log_likelihood + l2_loss
+        loss = (negative_log_likelihood * FLAGS.ensemble_size) + l2_loss
+        if FLAGS.diversity_loss_weight > 0.0:
+            loss += FLAGS.diversity_loss_weight * diversity_loss(logits,labels)
         # Scale the loss given the TPUStrategy will reduce sum all gradients.
-        scaled_loss = loss / strategy.num_replicas_in_sync
+        scaled_loss = (loss / strategy.num_replicas_in_sync)
 
       grads = tape.gradient(scaled_loss, model.trainable_variables)
       optimizer.apply_gradients(zip(grads, model.trainable_variables))
@@ -354,7 +394,8 @@ def main(argv):
       images = inputs['features']
       labels = inputs['labels']
       logits = model(images, training=False)
-      probs = tf.nn.softmax(logits)
+      probs = logits
+      #probs = tf.nn.softmax(logits)
 
       negative_log_likelihood = tf.reduce_mean(
           tf.keras.losses.sparse_categorical_crossentropy(labels, probs))
@@ -453,7 +494,6 @@ def main(argv):
       logging.info('Testing on dataset %s', dataset_name)
       logging.info('Starting to run eval at epoch: %s', epoch)
       test_start_time = time.time()
-      1/0
       test_step(test_iterator, 'test', dataset_name, steps_per_eval)
       ms_per_example = (time.time() - test_start_time) * 1e6 / batch_size
       metrics['test/ms_per_example'].update_state(ms_per_example)

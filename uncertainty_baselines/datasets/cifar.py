@@ -143,6 +143,7 @@ class _CifarDataset(base.BaseDataset):
       image_dtype = tf.bfloat16 if self._use_bfloat16 else tf.float32
       use_augmix = self._aug_params.get('augmix', False)
       num_augs = self._aug_params.get('aug_count',1)
+      ensemble_size = self._aug_params.get('ensemble_size', 1)
       # Note that self._seed will already be shape (2,), as is required for
       # stateless random ops, and so will per_example_step_seed.
       per_example_step_seed = tf.random.experimental.stateless_fold_in(
@@ -192,9 +193,11 @@ class _CifarDataset(base.BaseDataset):
               image, self._aug_params, augmenter, image_dtype,
               mean=CIFAR10_MEAN, std=CIFAR10_STD,
               seed=per_example_step_seeds[3])
-
+      else:
+          image = tf.stack([unaugmented_image for _ in range(ensemble_size)])
       # The image has values in the range [0, 1].
       # Optionally normalize by the dataset statistics.
+
       if not use_augmix:
         if self._normalize:
           image = augmix.normalize_convert_image(
